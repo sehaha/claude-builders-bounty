@@ -3,6 +3,7 @@
 Claude Code PR Reviewer Sub-Agent
 Analyzes GitHub Pull Request diffs and outputs structured Markdown review comments.
 Compliant with Claude Builders Bounty #4 acceptance criteria.
+Adversarially hardened against injection, SSRF, rate-limit starvation, and secret leakage.
 """
 
 import argparse
@@ -12,10 +13,12 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import urllib.parse
 import urllib.request
 import urllib.error
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 REVIEW_PROMPT_TEMPLATE = """You are an expert senior code reviewer and security auditor.
 Analyze the following Pull Request details and diff thoroughly.
@@ -29,7 +32,7 @@ PR Description:
 === GIT DIFF BEGIN ===
 {diff}
 === GIT DIFF END ===
-
+{truncation_note}
 You MUST produce a structured code review in strict Markdown format adhering to the following schema:
 
 ## 🤖 Claude Code PR Review
@@ -53,6 +56,34 @@ Follow with 1-2 sentences explaining why this score was assigned based on the di
 Do NOT include any extra introductory or concluding chatter outside of this Markdown structure.
 """
 
+SAFE_IDENT_REGEX = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
+ALLOWED_API_DOMAINS = {"api.anthropic.com", "127.0.0.1", "localhost", "api.exman.ai"}
+
+def sanitize_error(err_str: str) -> str:
+    """Masks authorization tokens, API keys, and private credentials from logs and outputs."""
+    if not isinstance(err_str, str):
+        err_str = str(err_str)
+    s = re.sub(r'(Bearer\s+[A-Za-z0-9_\-\.]{15,}|ghp_[A-Za-z0-9_]{30,}|sk-ant-[A-Za-z0-9_\-]{30,}|sk-proj-[A-Za-z0-9_\-]{30,}|github_pat_[A-Za-z0-9_]{30,})', '[REDACTED_CREDENTIAL]', err_str)
+    return s
+
+def validate_identifier(owner: str, repo: str, pr_num: int) -> Tuple[str, str, int]:
+    """Strictly validates repo name, owner, and PR number to prevent command or argument injection."""
+    if not SAFE_IDENT_REGEX.match(owner):
+        raise ValueError(f"Invalid owner format: '{owner}'")
+    if not SAFE_IDENT_REGEX.match(repo):
+        raise ValueError(f"Invalid repository format: '{repo}'")
+    if not isinstance(pr_num, int) or pr_num <= 0 or pr_num > 1_000_000_000:
+        raise ValueError(f"Invalid PR number: {pr_num}")
+    return owner, repo, pr_num
+
+def validate_api_base(api_base: str) -> str:
+    """Validates API base URL against SSRF target whitelist."""
+    parsed = urllib.parse.urlparse(api_base)
+    hostname = parsed.hostname or ""
+    if hostname.lower() not in ALLOWED_API_DOMAINS:
+        raise ValueError(f"SSRF Protection: api_base '{api_base}' is not in allowed domain whitelist.")
+    return api_base
+
 def parse_pr_identifier(pr_arg: str) -> Tuple[str, str, int]:
     """
     Parses PR identifier into (owner, repo, pr_number).
@@ -61,46 +92,111 @@ def parse_pr_identifier(pr_arg: str) -> Tuple[str, str, int]:
       - owner/repo#123
       - 123 (if inside a git repo with a github remote)
     """
+    cleaned = pr_arg.strip()
     # Pattern 1: Full URL
-    m = re.match(r"https?://github\.com/([^/]+)/([^/]+)/pull/(\d+)", pr_arg)
+    m = re.match(r"^https?://github\.com/([a-zA-Z0-9_\-\.]+)/([a-zA-Z0-9_\-\.]+)/pull/(\d+)/?$", cleaned)
     if m:
-        return m.group(1), m.group(2), int(m.group(3))
+        return validate_identifier(m.group(1), m.group(2), int(m.group(3)))
 
     # Pattern 2: owner/repo#123
-    m = re.match(r"([^/]+)/([^#]+)#(\d+)", pr_arg)
+    m = re.match(r"^([a-zA-Z0-9_\-\.]+)/([a-zA-Z0-9_\-\.]+)#(\d+)$", cleaned)
     if m:
-        return m.group(1), m.group(2), int(m.group(3))
+        return validate_identifier(m.group(1), m.group(2), int(m.group(3)))
 
     # Pattern 3: PR number alone
-    if pr_arg.isdigit():
-        pr_num = int(pr_arg)
+    if cleaned.isdigit():
+        pr_num = int(cleaned)
         try:
             res = subprocess.run(["git", "config", "--get", "remote.origin.url"], capture_output=True, text=True, check=True)
             url = res.stdout.strip()
-            # Match ssh or https
-            m = re.search(r"github\.com[:/]([^/]+)/([^/.]+)(?:\.git)?", url)
+            m = re.search(r"github\.com[:/]([a-zA-Z0-9_\-\.]+)/([a-zA-Z0-9_\-\.]+?)(?:\.git)?$", url)
             if m:
-                return m.group(1), m.group(2), pr_num
+                return validate_identifier(m.group(1), m.group(2), pr_num)
         except Exception:
             pass
 
-    raise ValueError(f"Could not parse GitHub PR identifier from: '{pr_arg}'. Expected 'https://github.com/owner/repo/pull/<num>'")
+    raise ValueError(f"Could not parse GitHub PR identifier from: '{pr_arg}'. Expected 'https://github.com/owner/repo/pull/<num>' or 'owner/repo#<num>'")
+
+def execute_with_retry(req: urllib.request.Request, max_retries: int = 3, timeout: int = 30) -> Tuple[int, bytes, Dict[str, str]]:
+    """Executes HTTP request with exponential backoff and rate limit recovery."""
+    delay = 1.5
+    for attempt in range(1, max_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                headers = {k.lower(): v for k, v in resp.getheaders()}
+                return resp.status, resp.read(), headers
+        except urllib.error.HTTPError as e:
+            status = e.code
+            err_headers = {k.lower(): v for k, v in e.headers.items()}
+            err_body = e.read()
+            if status == 401:
+                raise RuntimeError("GitHub Authentication Failed (HTTP 401). Verify GITHUB_TOKEN permissions.")
+            if status in (403, 429):
+                rem = err_headers.get("x-ratelimit-remaining", "")
+                reset_ts = err_headers.get("x-ratelimit-reset", "")
+                if rem == "0" and reset_ts:
+                    try:
+                        wait_sec = min(max(1, int(reset_ts) - int(time.time())), 60)
+                        if attempt < max_retries:
+                            time.sleep(wait_sec)
+                            continue
+                    except Exception:
+                        pass
+                raise RuntimeError(f"GitHub API Forbidden / Rate Limited (HTTP {status}). Check GITHUB_TOKEN or IP limits.")
+            if status in (500, 502, 503, 504) and attempt < max_retries:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            safe_err = sanitize_error(err_body.decode("utf-8", errors="replace"))
+            raise RuntimeError(f"HTTP Error {status}: {safe_err}")
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt < max_retries:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise RuntimeError(f"Network error after {max_retries} attempts: {sanitize_error(str(e))}")
+    raise RuntimeError("Max retries exceeded without response.")
+
+def get_paginated_changed_files(owner: str, repo: str, pr_num: int, headers: Dict[str, str]) -> List[str]:
+    """Fetches full list of changed filenames across all pages."""
+    file_list = []
+    page = 1
+    while page <= 10:  # safety ceiling 1000 files
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_num}/files?page={page}&per_page=100"
+        req = urllib.request.Request(api_url, headers=headers)
+        try:
+            status, raw_json, resp_headers = execute_with_retry(req, max_retries=2, timeout=20)
+            items = json.loads(raw_json.decode("utf-8"))
+            if not items:
+                break
+            for item in items:
+                fn = item.get("filename")
+                if fn:
+                    file_list.append(fn)
+            if len(items) < 100:
+                break
+            page += 1
+        except Exception:
+            break
+    return file_list
 
 def get_pr_metadata_and_diff(owner: str, repo: str, pr_num: int) -> Tuple[Dict[str, Any], str]:
-    """Fetches PR metadata and raw diff using gh CLI if available, else GitHub REST API."""
+    """Fetches PR metadata and raw diff using gh CLI if available, else GitHub REST API with retry."""
+    validate_identifier(owner, repo, pr_num)
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     
     # Try gh CLI first
-    if shutil.which("gh"):
+    gh_bin = shutil.which("gh")
+    if gh_bin:
         try:
             meta_res = subprocess.run(
-                ["gh", "pr", "view", str(pr_num), "--repo", f"{owner}/{repo}", "--json", "title,author,baseRefName,headRefName,body"],
+                [gh_bin, "pr", "view", str(pr_num), "--repo", f"{owner}/{repo}", "--json", "title,author,baseRefName,headRefName,body"],
                 capture_output=True, text=True, check=True
             )
             meta = json.loads(meta_res.stdout)
             
             diff_res = subprocess.run(
-                ["gh", "pr", "diff", str(pr_num), "--repo", f"{owner}/{repo}"],
+                [gh_bin, "pr", "diff", str(pr_num), "--repo", f"{owner}/{repo}"],
                 capture_output=True, text=True, check=True
             )
             diff = diff_res.stdout
@@ -111,13 +207,13 @@ def get_pr_metadata_and_diff(owner: str, repo: str, pr_num: int) -> Tuple[Dict[s
                 "head_ref": meta.get("headRefName", "branch"),
                 "description": meta.get("body", "") or "No description provided."
             }, diff
-        except Exception as e:
+        except Exception:
             # Fall back to REST API
             pass
 
     # GitHub REST API Fallback
     headers = {
-        "User-Agent": "Claude-Code-PR-Reviewer",
+        "User-Agent": "Claude-Code-PR-Reviewer/1.3",
         "Accept": "application/vnd.github.v3+json"
     }
     if token:
@@ -125,54 +221,65 @@ def get_pr_metadata_and_diff(owner: str, repo: str, pr_num: int) -> Tuple[Dict[s
 
     api_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_num}"
     req = urllib.request.Request(api_url, headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        pr_data = json.loads(resp.read().decode("utf-8"))
+    status, raw_json, _ = execute_with_retry(req)
+    pr_data = json.loads(raw_json.decode("utf-8"))
 
     # Fetch diff
     diff_headers = headers.copy()
     diff_headers["Accept"] = "application/vnd.github.v3.diff"
     diff_req = urllib.request.Request(api_url, headers=diff_headers)
-    with urllib.request.urlopen(diff_req, timeout=30) as resp:
-        diff_text = resp.read().decode("utf-8", errors="replace")
+    _, raw_diff, _ = execute_with_retry(diff_req)
+    diff_text = raw_diff.decode("utf-8", errors="replace")
+
+    # Fetch paginated file list for completeness audit
+    changed_files = get_paginated_changed_files(owner, repo, pr_num, headers)
 
     metadata = {
         "title": pr_data.get("title", ""),
-        "author": pr_data.get("user", {}).get("login", "unknown"),
-        "base_ref": pr_data.get("base", {}).get("ref", "main"),
-        "head_ref": pr_data.get("head", {}).get("ref", "branch"),
-        "description": pr_data.get("body", "") or "No description provided."
+        "author": pr_data.get("user", {}).get("login", "unknown") if pr_data.get("user") else "unknown",
+        "base_ref": pr_data.get("base", {}).get("ref", "main") if pr_data.get("base") else "main",
+        "head_ref": pr_data.get("head", {}).get("ref", "branch") if pr_data.get("head") else "branch",
+        "description": pr_data.get("body") or "No description provided.",
+        "changed_files": changed_files
     }
     return metadata, diff_text
 
-def truncate_diff_if_needed(diff: str, max_chars: int = 40000) -> str:
-    """Truncates very large diffs gracefully while preserving file headers."""
+def truncate_diff_if_needed(diff: str, max_chars: int = 45000, changed_files: List[str] = None) -> Tuple[str, str]:
+    """Truncates very large diffs gracefully while preserving file headers and providing clear notice."""
     if len(diff) <= max_chars:
-        return diff
+        return diff, ""
     
     lines = diff.splitlines()
     truncated_lines = []
     current_chars = 0
+    modified_files = set(changed_files or [])
     
     for line in lines:
+        if line.startswith("diff --git"):
+            parts = line.split()
+            if len(parts) >= 3:
+                modified_files.add(parts[2].replace("a/", ""))
         if current_chars + len(line) + 1 > max_chars:
-            truncated_lines.append("\n... [Diff truncated due to size. Focused on initial modified files] ...")
+            truncated_lines.append(f"\n... [Diff truncated due to size limit ({max_chars} chars). Evaluated initial files.] ...")
             break
         truncated_lines.append(line)
         current_chars += len(line) + 1
         
-    return "\n".join(truncated_lines)
+    all_files_str = ', '.join(list(modified_files)[:15])
+    trunc_note = f"\n⚠️ [NOTE: The complete diff exceeded {max_chars} chars and was truncated. Full changed file list ({len(modified_files)} files): {all_files_str}]\n"
+    return "\n".join(truncated_lines), trunc_note
 
 def run_claude_review(prompt: str, lane_id: Optional[int] = None, model: str = "claude-3-5-sonnet-20241022") -> str:
     """
     Executes Claude review via:
     1. Local Lane Manager (if lane_id is set or lane module available)
-    2. Anthropic API / LiteLLM / Gateway if configured
-    3. Official Claude CLI ('claude -p')
+    2. Local Gateway (http://127.0.0.1:8000/v1/messages)
+    3. Anthropic API endpoint
+    4. Official Claude CLI ('claude -p')
     """
-    # 1. Check if lane_manager is available and lane_id specified
+    # 1. Local Lane Manager
     if lane_id is not None:
         try:
-            # Check sys.path or hansong bounty root
             for p in ["/Users/eiden/hansong", str(Path.cwd()), str(Path.cwd().parent)]:
                 if p not in sys.path:
                     sys.path.insert(0, p)
@@ -180,26 +287,25 @@ def run_claude_review(prompt: str, lane_id: Optional[int] = None, model: str = "
             res = execute_lane(lane_id, prompt, model="sonnet", timeout=180)
             if res.get("success") and res.get("reply"):
                 return res["reply"].strip()
-        except Exception as e:
-            # Fall back
+        except Exception:
             pass
 
-    # 2. Check Gateway / LiteLLM / Anthropic API environment
+    # 2. Local Gateway / Anthropic API
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     api_base = os.environ.get("ANTHROPIC_BASE_URL") or os.environ.get("ANTHROPIC_API_BASE")
     
-    # Check if local gateway is running at port 8000
     if not api_base:
         try:
             req = urllib.request.Request("http://127.0.0.1:8000/health")
-            with urllib.request.urlopen(req, timeout=1) as resp:
+            with urllib.request.urlopen(req, timeout=1.0) as resp:
                 if resp.status == 200:
                     api_base = "http://127.0.0.1:8000"
         except Exception:
             pass
 
     if api_base:
-        url = f"{api_base.rstrip('/')}/v1/messages"
+        safe_base = validate_api_base(api_base)
+        url = f"{safe_base.rstrip('/')}/v1/messages"
         payload = {
             "model": model,
             "max_tokens": 4096,
@@ -211,17 +317,17 @@ def run_claude_review(prompt: str, lane_id: Optional[int] = None, model: str = "
         }
         if api_key:
             headers["x-api-key"] = api_key
-        if "127.0.0.1:8000" in api_base:
+        if "127.0.0.1" in safe_base or "localhost" in safe_base:
             headers["x-si-mode"] = "local"
 
         req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                for block in data.get("content", []):
-                    if block.get("type") == "text":
-                        return block.get("text", "").strip()
-        except Exception as e:
+            status, raw_resp, _ = execute_with_retry(req, max_retries=2, timeout=120)
+            data = json.loads(raw_resp.decode("utf-8"))
+            for block in data.get("content", []):
+                if block.get("type") == "text":
+                    return block.get("text", "").strip()
+        except Exception:
             pass
 
     # 3. Direct Claude CLI fallback
@@ -237,28 +343,30 @@ def run_claude_review(prompt: str, lane_id: Optional[int] = None, model: str = "
         if res.returncode == 0 and res.stdout.strip():
             return res.stdout.strip()
 
-    raise RuntimeError("Failed to invoke Claude review: No Claude CLI, local lane, or API endpoint available.")
+    raise RuntimeError("Failed to invoke Claude review: No active Claude CLI, local lane, or API endpoint available.")
 
 def post_comment_to_pr(owner: str, repo: str, pr_num: int, comment_body: str) -> bool:
-    """Posts review comment back to GitHub PR."""
+    """Posts review comment back to GitHub PR with retry and token protection."""
+    validate_identifier(owner, repo, pr_num)
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     
     # Try gh CLI
-    if shutil.which("gh"):
+    gh_bin = shutil.which("gh")
+    if gh_bin:
         try:
-            subprocess.run(
-                ["gh", "pr", "comment", str(pr_num), "--repo", f"{owner}/{repo}", "--body", comment_body],
-                check=True, capture_output=True
+            res = subprocess.run(
+                [gh_bin, "pr", "comment", str(pr_num), "--repo", f"{owner}/{repo}", "--body", comment_body],
+                check=True, capture_output=True, text=True
             )
             return True
-        except Exception:
+        except Exception as e:
             pass
 
-    # Fallback to GitHub REST API
+    # Fallback to GitHub REST API with retry
     if token:
         api_url = f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_num}/comments"
         headers = {
-            "User-Agent": "Claude-Code-PR-Reviewer",
+            "User-Agent": "Claude-Code-PR-Reviewer/1.3",
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github.v3+json",
             "Content-Type": "application/json"
@@ -266,10 +374,10 @@ def post_comment_to_pr(owner: str, repo: str, pr_num: int, comment_body: str) ->
         data = json.dumps({"body": comment_body}).encode("utf-8")
         req = urllib.request.Request(api_url, data=data, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return resp.status in (200, 201)
+            status, raw_resp, _ = execute_with_retry(req, max_retries=3, timeout=30)
+            return status in (200, 201)
         except Exception as e:
-            print(f"[!] Warning: Failed to post comment via API: {e}", file=sys.stderr)
+            print(f"[!] Warning: Failed to post comment via API: {sanitize_error(str(e))}", file=sys.stderr)
             return False
 
     return False
@@ -295,28 +403,29 @@ def main():
     try:
         meta, diff = get_pr_metadata_and_diff(owner, repo, pr_num)
     except Exception as e:
-        print(f"Error fetching PR data: {e}", file=sys.stderr)
+        print(f"Error fetching PR data: {sanitize_error(str(e))}", file=sys.stderr)
         sys.exit(1)
 
     if not diff.strip():
         print("Error: PR diff is empty or cannot be retrieved.", file=sys.stderr)
         sys.exit(1)
 
-    clean_diff = truncate_diff_if_needed(diff)
+    clean_diff, trunc_note = truncate_diff_if_needed(diff, changed_files=meta.get("changed_files"))
     prompt = REVIEW_PROMPT_TEMPLATE.format(
         title=meta["title"],
         author=meta["author"],
         base_ref=meta["base_ref"],
         head_ref=meta["head_ref"],
         description=meta["description"],
-        diff=clean_diff
+        diff=clean_diff,
+        truncation_note=trunc_note
     )
 
     print(f"[*] Analyzing PR diff with Claude (Lane: {args.lane if args.lane is not None else 'Default'})...", file=sys.stderr)
     try:
         review = run_claude_review(prompt, lane_id=args.lane, model=args.model)
     except Exception as e:
-        print(f"Error during review generation: {e}", file=sys.stderr)
+        print(f"Error during review generation: {sanitize_error(str(e))}", file=sys.stderr)
         sys.exit(1)
 
     # Output to stdout
@@ -324,10 +433,13 @@ def main():
 
     # Optional file output
     if args.output:
-        out_path = Path(args.output)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(review, encoding="utf-8")
-        print(f"[+] Review saved to {out_path}", file=sys.stderr)
+        try:
+            out_path = Path(args.output).resolve()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(review, encoding="utf-8")
+            print(f"[+] Review saved to {out_path}", file=sys.stderr)
+        except Exception as e:
+            print(f"[!] Warning: Could not write output file: {sanitize_error(str(e))}", file=sys.stderr)
 
     # Optional PR comment posting
     if args.post:
@@ -335,7 +447,7 @@ def main():
         if post_comment_to_pr(owner, repo, pr_num, review):
             print(f"[+] Successfully posted review to PR #{pr_num}!", file=sys.stderr)
         else:
-            print("[!] Could not post comment. Check GITHUB_TOKEN permissions or gh auth.", file=sys.stderr)
+            print("[!] Could not post comment. Check GITHUB_TOKEN permissions or network connectivity.", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
